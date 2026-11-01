@@ -20,3 +20,5 @@ Recent sailfish series:
   `sailhubswap=1`, `sailhubdbg=1`. Untested on device.
 - `0185` IOHIDEventService sensor services (accel/gyro/compass/ALS) fed by
   `sweet_hid_sensor()` from the 0184 driver.
+
+CI: push-triggered on changes under this directory.
