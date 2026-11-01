@@ -96,6 +96,8 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, marlin=False):
     """Build one board profile; qemu retains the legacy virtual-machine tree."""
     if pixel1 and marlin:
         raise ValueError('choose one of pixel1 or marlin')
+    if qemu and (pixel1 or marlin):
+        raise ValueError('qemu cannot be combined with a physical MSM8996 board profile')
     msm8996 = pixel1 or marlin
     P = MARLIN if marlin else PIXEL1
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)

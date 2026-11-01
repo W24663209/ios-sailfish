@@ -22,11 +22,11 @@ if b[:8] != b'ANDROID!':
     raise SystemExit('not an Android boot image')
 header_version = struct.unpack_from('<I', b, 40)[0]
 page_size = struct.unpack_from('<I', b, 36)[0]
-cmdline = b[64:576].rstrip(b'\0')
+cmdline = b[64:576].split(b'\0', 1)[0]
 if header_version != 0 or page_size != 4096:
     raise SystemExit(f'need a first-generation Pixel XL v0/4096 boot image; got header={header_version} page={page_size}')
-if b'marlin' not in cmdline:
-    raise SystemExit('refusing a non-marlin stock boot image (cmdline lacks androidboot.hardware=marlin)')
+if b'androidboot.hardware=marlin' not in cmdline:
+    raise SystemExit('refusing a non-marlin stock boot image (missing androidboot.hardware=marlin)')
 PY
 
 cd "$(dirname "$0")"
