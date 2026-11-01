@@ -1,0 +1,197 @@
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -75,5 +75,29 @@
+     "   {",
+     "     'IOClass'         = SweetHIDTouch;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++    "   {",
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorAccel;"
++    "     'SensorKind'      = 0;"
++    "   },"
++    "   {",
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorGyro;"
++    "     'SensorKind'      = 1;"
++    "   },"
++    "   {",
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorCompass;"
++    "     'SensorKind'      = 2;"
++    "   },"
++    "   {",
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorAls;"
++    "     'SensorKind'      = 3;"
++    "   },"
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -1894,7 +1894,162 @@
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++/*
++ * Sensor event services fed by the nanohub driver (bsd/dev/sailfish_nanohub.c
++ * -> sweet_hid_sensor()). One service per physical sensor; which one a
++ * personality instantiates comes in as the "SensorKind" number property:
++ *   0 = accelerometer (hub reports m/s^2, IOHIDEvent wants g)
++ *   1 = gyroscope     (rad/s, passed through)
++ *   2 = compass       (uT, passed through)
++ *   3 = ambient light (lux float bits)
++ * The hub floats arrive as raw little-endian IEEE754 bit patterns; the BSD
++ * driver stays FP-free, reinterpretation and scaling happen here.
++ */
++#ifndef kHIDUsage_Snsr_Motion_Compass3D
++#define kHIDUsage_Snsr_Motion_Compass3D 0x83
++#endif
++
++static SweetHIDSensor *gSweetSensorAccel;
++static SweetHIDSensor *gSweetSensorGyro;
++static SweetHIDSensor *gSweetSensorCompass;
++static SweetHIDSensor *gSweetSensorAls;
++
++class SweetHIDSensor : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDSensor);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void sample(const uint32_t bits[3]);
++	void alsLux(uint32_t lux_bits);
++protected:
++	unsigned fKind;
++	IOLock *fLock;
++	unsigned kindFromProperty(void)
++	{
++		OSNumber *n = OSDynamicCast(OSNumber, getProperty("SensorKind"));
++		return n ? n->unsigned32BitValue() : (unsigned)0;
++	}
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Sensor; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE
++	{
++		switch (kindFromProperty()) {
++		case 1: return kHIDUsage_Snsr_Motion_Gyrometer3D;
++		case 2: return kHIDUsage_Snsr_Motion_Compass3D;
++		case 3: return kHIDUsage_Snsr_Light_AmbientLight;
++		default: return kHIDUsage_Snsr_Motion_Accelerometer3D;
++		}
++	}
++private:
++	static float toFloat(uint32_t bits)
++	{
++		float f;
++		memcpy(&f, &bits, sizeof(f));
++		return f;
++	}
++};
++OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
++
++bool
++SweetHIDSensor::start(IOService *provider)
++{
++	fKind = kindFromProperty();
++	fLock = IOLockAlloc();
++	if (!fLock || !IOHIDEventService::start(provider)) {
++		return false;
++	}
++	switch (fKind) {
++	case 1: gSweetSensorGyro = this; break;
++	case 2: gSweetSensorCompass = this; break;
++	case 3: gSweetSensorAls = this; break;
++	default: gSweetSensorAccel = this; break;
++	}
++	/* CoreBrightness matches ALS services by these properties on iOS. */
++	if (fKind == 3) {
++		setProperty("AppleDisplayAmbientLightSensor", kOSBooleanTrue);
++	}
++	registerService();
++	IOLog("SWEET HID: sensor kind %u registered\n", fKind);
++	return true;
++}
++
++void
++SweetHIDSensor::sample(const uint32_t bits[3])
++{
++	float fx = toFloat(bits[0]);
++	float fy = toFloat(bits[1]);
++	float fz = toFloat(bits[2]);
++	IOHIDEvent *e;
++
++	if (fKind == 0) { /* m/s^2 -> g for the accelerometer */
++		fx /= 9.80665f;
++		fy /= 9.80665f;
++		fz /= 9.80665f;
++	}
++	IOLockLock(fLock);
++	uint64_t now = mach_absolute_time();
++	if (fKind == 1) {
++		e = IOHIDEvent::gyroEvent(now, (IOFixed)(fx * 65536.0f),
++		    (IOFixed)(fy * 65536.0f), (IOFixed)(fz * 65536.0f));
++	} else if (fKind == 2) {
++		e = IOHIDEvent::compassEvent(now, (IOFixed)(fx * 65536.0f),
++		    (IOFixed)(fy * 65536.0f), (IOFixed)(fz * 65536.0f));
++	} else {
++		e = IOHIDEvent::accelerometerEvent(now, (IOFixed)(fx * 65536.0f),
++		    (IOFixed)(fy * 65536.0f), (IOFixed)(fz * 65536.0f));
++	}
++	IOLockUnlock(fLock);
++	if (!e) {
++		return;
++	}
++	dispatchEvent(e);
++	e->release();
++}
++
++void
++SweetHIDSensor::alsLux(uint32_t lux_bits)
++{
++	float lux = toFloat(lux_bits);
++	IOHIDEvent *e;
++
++	IOLockLock(fLock);
++	e = IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(),
++	    (UInt32)lux, 0, 0, 0, 0);
++	IOLockUnlock(fLock);
++	if (!e) {
++		return;
++	}
++	dispatchEvent(e);
++	e->release();
++}
++
++/* kind: 0 accel, 1 gyro, 2 compass (float bits), 3 ALS (lux float bits). */
++extern "C" void
++sweet_hid_sensor(int kind, uint32_t x, uint32_t y, uint32_t z)
++{
++	const uint32_t v[3] = { x, y, z };
++	switch (kind) {
++	case 0:
++		if (gSweetSensorAccel) {
++			gSweetSensorAccel->sample(v);
++		}
++		break;
++	case 1:
++		if (gSweetSensorGyro) {
++			gSweetSensorGyro->sample(v);
++		}
++		break;
++	case 2:
++		if (gSweetSensorCompass) {
++			gSweetSensorCompass->sample(v);
++		}
++		break;
++	case 3:
++		if (gSweetSensorAls) {
++			gSweetSensorAls->alsLux(x);
++		}
++		break;
++	}
++}

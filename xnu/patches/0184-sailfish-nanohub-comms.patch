@@ -1,0 +1,782 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sailfish_wlan.c			standard
++bsd/dev/sailfish_nanohub.c		standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,5 +54,6 @@
+ extern void sweet_perf_init(void);
+ extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
+ extern void sailfish_wlan_init(void);
++extern void sailfish_nanohub_init(void);
+ extern void sweet_usb_probe(void);
+@@ -664,6 +665,7 @@
+ 	sweet_usb_probe();
+ 	sweet_perf_init();
+ 	sweet_gpu_init();
+ 	sailfish_wlan_init();
++	sailfish_nanohub_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sailfish_nanohub.c
+@@ -0,0 +1,752 @@
++/*
++ * Pixel 1 (sailfish) sensors through the nanohub (STM32F4 sensor hub) on
++ * BLSP1 QUP6 SPI (0x757a000). The hub aggregates the board sensors (BMI160
++ * accel+gyro, AKM magnetometer, ALS/proximity) and speaks Google's nanohub
++ * protocol (drivers/staging/nanohub in the msm kernel, comms.c packet format).
++ * The sensor app (app id 2, "Googl"/2) is part of the hub OS image, so no
++ * firmware upload: we only replicate the comms layer and the sensor HAL's
++ * config/read protocol (device/google/contexthub sensorhal/hubconnection.cpp).
++ *
++ * Pins (msm8996-htc-nanohub-v2.dtsi, pinctrl-msm8996.c function numbers,
++ * gpio = function 0, listed functions start at 1):
++ *   25 CLK (blsp_spi6 = func 3), 26 MOSI (func 2), 28 MISO (func 1),
++ *   27 CS as GPIO (active low), 24 wakeup AP2SH (GPIO out),
++ *   38 nreset (GPIO out, active low), 130 boot0 (GPIO out, low = flash boot),
++ *   123 irq1 (TLMM in, active low), 117 irq2 (TLMM in)
++ * Clocks: GCC BLSP1 AHB vote (0x352004 bit 17, shared with touch QUP3 I2C)
++ *   + gcc_blsp1_qup6_spi_apps_clk CBCR 0x323004, RCGR 0x32300c (XO div 2 =
++ *   9.6 MHz; Linux spi-qup.c drives the SPI bit clock directly from cclk).
++ * Rails: PM8994 L19 2.85 V via sweet_rpm_ldoa(19, 2850000).
++ * Everything runs on one thread started from sailfish_nanohub_init(); all
++ * transfers are polled (no interrupts). Boot-args:
++ *   sailhub=1 enables (default off), sailhubdelay=S (default 10),
++ *   sailhubhz=N accel/gyro rate (default 25), sailhubswap=1 swaps the
++ *   MOSI/MISO pin guess, sailhubdbg=1 dumps raw packets.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
++extern void sweet_hid_sensor(int kind, uint32_t x, uint32_t y, uint32_t z);
++void sailfish_nanohub_init(void);
++
++#define HUB_GPIO_PA     0x01010000u     /* TLMM, one 4 KiB tile per GPIO */
++#define HUB_QUP_PA      0x0757a000u     /* BLSP1 QUP6 */
++#define HUB_VOTE_PA     0x00352000u     /* +4: APCS_CLOCK_BRANCH_ENA_VOTE */
++#define HUB_CBCR        0x00323004u     /* gcc_blsp1_qup6_spi_apps_clk */
++#define HUB_RCGR        0x0032300cu     /* CMD_RCGR; +4 CFG */
++
++/* QUP registers (mainline spi-qup.c) */
++#define QUP_CONFIG      0x000u
++#define QUP_STATE       0x004u
++#define QUP_IO_MODE     0x008u
++#define QUP_SW_RESET    0x00cu
++#define QUP_OPERATIONAL 0x018u
++#define QUP_ERROR_FLAGS 0x01cu
++#define QUP_MX_OUTPUT_CNT 0x100u
++#define QUP_OUT_FIFO    0x110u
++#define QUP_MX_WRITE_CNT 0x150u
++#define QUP_MX_INPUT_CNT 0x200u
++#define QUP_MX_READ_CNT 0x208u
++#define QUP_IN_FIFO     0x218u
++#define SPI_CONFIG      0x300u
++#define SPI_IO_CONTROL  0x304u
++#define SPI_ERROR_FLAGS 0x308u
++#define QUP_STATE_VALID   (1u << 2)
++#define QUP_STATE_RESET   0u
++#define QUP_STATE_RUN     1u
++#define QUP_STATE_PAUSE   3u
++#define QUP_OP_IN_NOT_EMPTY (1u << 5)
++#define QUP_OP_OUT_FIFO_FULL (1u << 6)
++#define QUP_OP_OUT_SVC  (1u << 8)
++#define QUP_OP_IN_SVC   (1u << 9)
++#define QUP_OP_MAX_OUTPUT_DONE (1u << 10)
++#define QUP_OP_MAX_INPUT_DONE (1u << 11)
++#define QUP_CFG_SPI_MODE (1u << 8)
++#define QUP_CFG_NO_INPUT (1u << 7)
++#define QUP_CFG_NO_OUTPUT (1u << 6)
++#define QUP_CFG_N       0x001fu
++#define QUP_IOM_IN_MASK (3u << 12)
++#define QUP_IOM_OUT_MASK (3u << 10)
++#define QUP_IOM_PACK_EN (1u << 15)
++#define QUP_IOM_UNPACK_EN (1u << 14)
++#define SPI_CFG_INPUT_FIRST (1u << 9)   /* SPI mode 0 */
++#define SPI_IOC_NO_TRI_STATE (1u << 0)
++
++/* nanohub comms protocol (drivers/staging/nanohub/comms.h) */
++#define NH_SYNC         0x31u
++#define NH_CMD_ACK      0x00000000u
++#define NH_CMD_NACK     0x00000001u
++#define NH_CMD_BUSY     0x00000002u
++#define NH_CMD_GET_OS_HW_VERSIONS 0x00001000u
++#define NH_CMD_CLR_GET_INTR 0x00001080u
++#define NH_CMD_READ     0x00001090u
++#define NH_CMD_WRITE    0x00001091u
++#define NH_TIMEOUT_WRITE 544u
++#define NH_TIMEOUT_ACK   272u
++#define NH_TIMEOUT_REPLY 512u
++#define NH_PKT_MAX      (11u + 255u + 4u)
++
++/* nanohub event numbers (firmware/os/inc/eventnums.h, sensType.h) */
++#define NH_EVT_RESET_REASON   0x00000403u
++#define NH_EVT_ALOG           0x474f4c41u  /* "ALOG": hub OS log */
++#define NH_EVT_SENSOR_BASE    0x00000200u
++#define NH_SENS_ACCEL   1u
++#define NH_SENS_GYRO    2u
++#define NH_SENS_MAG     3u
++#define NH_SENS_PROX    6u
++#define NH_SENS_ALS     7u
++#define NH_CONFIG_EVT   0x00000300u
++#define NH_CFG_ENABLE   1u
++
++/* sensor kinds for sweet_hid_sensor() (float bits, little endian) */
++#define SHID_ACCEL  0
++#define SHID_GYRO   1
++#define SHID_COMPASS 2
++#define SHID_ALS    3
++
++static struct {
++	bool started;
++	vm_offset_t vote, cbcr, rcgr, qup;
++	vm_offset_t gpio_clk, gpio_mosi, gpio_miso, gpio_cs;
++	vm_offset_t gpio_wake, gpio_reset, gpio_boot0, gpio_irq1, gpio_irq2;
++	unsigned swap;            /* sailhubswap: swap MOSI/MISO pin roles */
++	unsigned dbg;             /* sailhubdbg: raw packet dumps */
++	unsigned hz;              /* sailhubhz: accel/gyro rate */
++	uint32_t seq;
++	uint32_t interrupts[8];   /* last hub interrupt bitmask from an ACK */
++	bool enabled[16];         /* sensor type -> configured */
++} st;
++static int hub_sleep_chan;
++
++static uint32_t
++hub_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++hub_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++hub_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hub_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++nh_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint64_t
++nh_le64(const uint8_t *p)
++{
++	return (uint64_t)nh_le32(p) | ((uint64_t)nh_le32(p + 4) << 32);
++}
++
++static void
++nh_st_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static void
++nh_st_le64(uint8_t *p, uint64_t v)
++{
++	nh_st_le32(p, (uint32_t)v);
++	nh_st_le32(p + 4, (uint32_t)(v >> 32));
++}
++
++/* nanohub CRC32, nibble-at-a-time, seed ~0 (comms.c crc32). */
++static const uint32_t nh_crc_table[16] = {
++	0x00000000, 0x04C11DB7, 0x09823B6E, 0x0D4326D9,
++	0x130476DC, 0x17C56B6B, 0x1A864DB2, 0x1E475005,
++	0x2608EDB8, 0x22C9F00F, 0x2F8AD6D6, 0x2B4BCB61,
++	0x350C9B64, 0x31CD86D3, 0x3C8EA00A, 0x384FBDBD
++};
++
++static uint32_t
++nh_crc32(const uint8_t *buffer, unsigned length, uint32_t crc)
++{
++	unsigned i;
++	for (i = 0; i < (length >> 2); i++) {
++		crc ^= nh_le32(buffer + 4 * i);
++		for (int n = 0; n < 8; n++) {
++			crc = (crc << 4) ^ nh_crc_table[crc >> 28];
++		}
++	}
++	if (length & 3) {
++		uint32_t word = 0;
++		for (unsigned j = (length & ~3u); j < length; j++) {
++			word |= (uint32_t)buffer[j] << ((j & 3u) * 8u);
++		}
++		crc ^= word;
++		for (int n = 0; n < 8; n++) {
++			crc = (crc << 4) ^ nh_crc_table[crc >> 28];
++		}
++	}
++	return crc;
++}
++
++/* ---------------- GPIO ---------------- */
++
++static void
++hub_gpio_cfg(vm_offset_t tile, unsigned func, unsigned pull, bool out, bool high)
++{
++	if (out) {
++		/* Latch before enabling the driver (reset lines are active low). */
++		hub_wr(tile, 4, high ? 2u : 0u);
++	}
++	hub_wr(tile, 0, (func << 2) | pull | (out ? 0x200u : 0u));
++}
++
++/* ---------------- QUP SPI master (FIFO mode, 8-bit words, polled) ---------------- */
++
++static bool
++qup_state(uint32_t want)
++{
++	for (unsigned i = 0; i < 200; i++) {
++		uint32_t s = hub_rd(st.qup, QUP_STATE);
++		if ((s & QUP_STATE_VALID) && (s & 3u) == want) {
++			return true;
++		}
++		if (s & QUP_STATE_VALID) {
++			hub_wr(st.qup, QUP_STATE, want);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++qup_clocks(void)
++{
++	/* BLSP1 AHB vote bit 17 is shared with touch; read-modify-write. */
++	hub_wr(st.vote, 4, hub_rd(st.vote, 4) | (1u << 17));
++	/* gcc_blsp1_qup6_spi_apps_clk: XO (19.2 MHz) / 2 = 9.6 MHz, no MND. */
++	uint32_t cfg = hub_rd(st.rcgr, 4);
++	cfg = (cfg & ~0x371fu) | 2u;
++	hub_wr(st.rcgr, 4, cfg);
++	hub_wr(st.rcgr, 0, hub_rd(st.rcgr, 0) | 1u);
++	for (unsigned i = 0; i < 1000 && (hub_rd(st.rcgr, 0) & 1u); i++) {
++		delay(1);
++	}
++	hub_wr(st.cbcr, 0, hub_rd(st.cbcr, 0) | 1u);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(hub_rd(st.cbcr, 0) & (1u << 31))) {
++			printf("NANOHUB: clocks on (vote=%#x cbcr=%#x rcgr=%#x/%#x)\n",
++			    hub_rd(st.vote, 4), hub_rd(st.cbcr, 0),
++			    hub_rd(st.rcgr, 0), hub_rd(st.rcgr, 4));
++			return true;
++		}
++		delay(1);
++	}
++	printf("NANOHUB: QUP6 SPI clock stays off (cbcr=%#x rcgr=%#x/%#x)\n",
++	    hub_rd(st.cbcr, 0), hub_rd(st.rcgr, 0), hub_rd(st.rcgr, 4));
++	return false;
++}
++
++/*
++ * Full-duplex `len` bytes. TX bytes sit in the high byte of each 32-bit FIFO
++ * word, RX bytes come back in the low byte (Linux spi_qup_fifo_write/read).
++ * The transfer is fed/drained in a polling loop, so `len` may exceed the
++ * FIFO depth. CS, wakeup and the open/close delays are the caller's job.
++ */
++static int
++qup_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	unsigned sent = 0, got = 0;
++	if (len == 0 || len > 2048) {
++		return EIO;
++	}
++	if (!qup_state(QUP_STATE_RESET)) {
++		return EIO;
++	}
++	hub_wr(st.qup, QUP_MX_OUTPUT_CNT, 0);
++	hub_wr(st.qup, QUP_MX_INPUT_CNT, 0);
++	hub_wr(st.qup, QUP_MX_WRITE_CNT, len);
++	hub_wr(st.qup, QUP_MX_READ_CNT, len);
++	hub_wr(st.qup, QUP_IO_MODE,
++	    hub_rd(st.qup, QUP_IO_MODE) &
++	    ~(QUP_IOM_IN_MASK | QUP_IOM_OUT_MASK | QUP_IOM_PACK_EN | QUP_IOM_UNPACK_EN));
++	hub_wr(st.qup, SPI_CONFIG, SPI_CFG_INPUT_FIRST); /* mode 0, no HS */
++	hub_wr(st.qup, QUP_CONFIG, QUP_CFG_SPI_MODE | 7u); /* 8-bit words */
++	hub_wr(st.qup, QUP_ERROR_FLAGS, 0x7cu);
++	hub_wr(st.qup, SPI_ERROR_FLAGS, 3u);
++	if (!qup_state(QUP_STATE_RUN) || !qup_state(QUP_STATE_PAUSE)) {
++		return EIO;
++	}
++	/* Preload what fits while the clocks are still stopped. */
++	while (sent < len && !(hub_rd(st.qup, QUP_OPERATIONAL) & QUP_OP_OUT_FIFO_FULL)) {
++		hub_wr(st.qup, QUP_OUT_FIFO, (uint32_t)tx[sent++] << 24);
++	}
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EIO;
++	}
++	for (unsigned t = 0; t < 200000; t++) {
++		uint32_t op = hub_rd(st.qup, QUP_OPERATIONAL);
++		if (op & (QUP_OP_OUT_SVC | QUP_OP_IN_SVC)) {
++			hub_wr(st.qup, QUP_OPERATIONAL, op & (QUP_OP_OUT_SVC | QUP_OP_IN_SVC));
++		}
++		while (got < len && (hub_rd(st.qup, QUP_OPERATIONAL) & QUP_OP_IN_NOT_EMPTY)) {
++			rx[got++] = (uint8_t)hub_rd(st.qup, QUP_IN_FIFO);
++		}
++		op = hub_rd(st.qup, QUP_OPERATIONAL);
++		while (sent < len && !(op & QUP_OP_OUT_FIFO_FULL)) {
++			hub_wr(st.qup, QUP_OUT_FIFO, (uint32_t)tx[sent++] << 24);
++			op = hub_rd(st.qup, QUP_OPERATIONAL);
++		}
++		if ((op & (QUP_OP_MAX_OUTPUT_DONE | QUP_OP_MAX_INPUT_DONE)) ==
++		    (QUP_OP_MAX_OUTPUT_DONE | QUP_OP_MAX_INPUT_DONE)) {
++			while (got < len && (hub_rd(st.qup, QUP_OPERATIONAL) & QUP_OP_IN_NOT_EMPTY)) {
++				rx[got++] = (uint8_t)hub_rd(st.qup, QUP_IN_FIFO);
++			}
++			(void)qup_state(QUP_STATE_RESET);
++			return got == len ? 0 : EIO;
++		}
++		delay(1);
++	}
++	(void)qup_state(QUP_STATE_RESET);
++	return ETIMEDOUT;
++}
++
++/* ---------------- nanohub packet protocol ---------------- */
++
++static void
++nh_open(void)
++{
++	hub_wr(st.gpio_wake, 4, 2u);   /* AP2SH high: hold the hub awake */
++	delay(40);
++	hub_wr(st.gpio_cs, 4, 0u);     /* CS low */
++	delay(30);
++}
++
++static void
++nh_close(void)
++{
++	hub_wr(st.gpio_cs, 4, 2u);     /* CS high */
++	delay(60);
++}
++
++/*
++ * Find a valid packet in a raw RX stream (the hub pads with 0xFF and may
++ * answer in the same window as the command). Returns its total size or 0.
++ */
++static unsigned
++nh_scan(const uint8_t *buf, unsigned len, unsigned *out_off)
++{
++	for (unsigned i = 0; i + 11u <= len; i++) {
++		unsigned plen, total;
++		uint32_t crc;
++		if (buf[i] != NH_SYNC) {
++			continue;
++		}
++		plen = buf[i + 9];
++		total = 10u + plen + 4u;
++		if (i + total > len) {
++			continue;
++		}
++		crc = nh_crc32(buf + i, 10u + plen, ~0u);
++		if (crc == nh_le32(buf + i + 10u + plen)) {
++			*out_off = i;
++			return total;
++		}
++	}
++	return 0;
++}
++
++static void
++nh_dump(const char *what, const uint8_t *buf, unsigned len)
++{
++	unsigned i;
++	printf("NANOHUB: %s (%u):", what, len);
++	for (i = 0; i < len && i < 64; i++) {
++		printf("%s%02x", (i % 4) ? "" : " ", buf[i]);
++	}
++	printf("\n");
++}
++
++/*
++ * One command exchange: open, send the packet plus idle clocks for the ACK
++ * window, then (on ACK) more clocks for the reply. Mirrors comms.c
++ * nanohub_comms_tx_rx_retrans with bounded retries.
++ */
++static int
++nh_cmd(uint32_t reason, const uint8_t *tx, unsigned txlen,
++    uint8_t *rx, unsigned rxmax)
++{
++	uint8_t pkt[NH_PKT_MAX];
++	uint8_t stream[NH_PKT_MAX + NH_TIMEOUT_WRITE + NH_TIMEOUT_REPLY];
++	uint8_t window[NH_TIMEOUT_REPLY];
++	unsigned pkt_len, clocks, ack_off = 0, ack_len = 0;
++	uint32_t seq;
++
++	if (txlen > 255) {
++		return EINVAL;
++	}
++	seq = ++st.seq;
++	pkt[0] = NH_SYNC;
++	nh_st_le32(pkt + 1, seq);
++	nh_st_le32(pkt + 5, reason);
++	pkt[9] = (uint8_t)txlen;
++	if (txlen) {
++		memcpy(pkt + 10, tx, txlen);
++	}
++	nh_st_le32(pkt + 10 + txlen, nh_crc32(pkt, 10 + txlen, ~0u));
++	pkt_len = 14 + txlen;
++
++	for (unsigned retry = 0; retry < 8; retry++) {
++		memset(stream, 0xff, sizeof(stream));
++		memcpy(stream, pkt, pkt_len);
++		clocks = ((pkt_len + 3u) & ~3u) + NH_TIMEOUT_WRITE;
++		nh_open();
++		int err = qup_xfer(stream, stream, clocks);
++		if (!err) {
++			ack_len = nh_scan(stream, clocks, &ack_off);
++		}
++		if (err || !ack_len) {
++			nh_close();
++			if (st.dbg) {
++				nh_dump(err ? "xfer err, raw" : "no ack, raw",
++				    stream, clocks < 64 ? clocks : 64);
++			}
++			continue;
++		}
++		const uint8_t *ack = stream + ack_off;
++		if (nh_le32(ack + 1) != seq) {
++			nh_close();
++			printf("NANOHUB: seq mismatch (got %u want %u)\n",
++			    nh_le32(ack + 1), seq);
++			continue;
++		}
++		uint32_t why = nh_le32(ack + 5);
++		if (why == NH_CMD_NACK) {
++			nh_close();
++			delay(500); /* RESEND_SHORT_DELAY_US..1 ms */
++			continue;
++		}
++		if (why == NH_CMD_BUSY) {
++			nh_close();
++			hub_wait(100); /* 100 ms busy backoff */
++			continue;
++		}
++		if (why != NH_CMD_ACK) {
++			nh_close();
++			printf("NANOHUB: reason %#x in ack window\n", why);
++			continue;
++		}
++		if (ack[10] == 32) {
++			memcpy(st.interrupts, ack + 11, 32);
++		}
++		/* ACK: read the real reply. */
++		memset(window, 0xff, sizeof(window));
++		err = qup_xfer(window, window, NH_TIMEOUT_REPLY);
++		nh_close();
++		if (err) {
++			continue;
++		}
++		unsigned rply_off = 0, rply_len = nh_scan(window, sizeof(window), &rply_off);
++		if (!rply_len || nh_le32(window + rply_off + 1) != seq) {
++			continue;
++		}
++		const uint8_t *rply = window + rply_off;
++		unsigned dlen = rply[9];
++		unsigned n = dlen < rxmax ? dlen : rxmax;
++		if (n) {
++			memcpy(rx, rply + 10, n);
++		}
++		if (st.dbg) {
++			printf("NANOHUB: cmd %#x seq %u reply len %u ints0 %#x\n",
++			    reason, seq, dlen, st.interrupts[0]);
++		}
++		return (int)n;
++	}
++	return EIO;
++}
++
++/* ---------------- sensors ---------------- */
++
++/* ConfigCmd (sensorhal/hubconnection.h): rate is q10 Hz, latency ns. */
++static int
++nh_config_sensor(uint8_t type, bool enable, uint32_t rate_q10)
++{
++	uint8_t cmd[4 + 8 + 4 + 1 + 1 + 2];
++	uint8_t ret = 0;
++	nh_st_le32(cmd + 0, NH_CONFIG_EVT);
++	nh_st_le64(cmd + 4, 0);                 /* latency 0: no batching */
++	nh_st_le32(cmd + 12, rate_q10);
++	cmd[16] = type;
++	cmd[17] = enable ? NH_CFG_ENABLE : 0;
++	cmd[18] = cmd[19] = 0;
++	int n = nh_cmd(NH_CMD_WRITE, cmd, sizeof(cmd), &ret, 1);
++	if (n == 1 && ret == 0) {
++		st.enabled[type] = enable;
++		return 0;
++	}
++	return n < 0 ? n : EIO;
++}
++
++static void
++nh_push(int kind, uint32_t x, uint32_t y, uint32_t z)
++{
++	static unsigned delivered;
++	sweet_hid_sensor(kind, x, y, z);
++	if ((++delivered % 2000u) == 0) {
++		printf("NANOHUB: %u samples delivered to HID\n", delivered);
++	}
++}
++
++/* Decode one HostIntfDataBuffer from CMD_COMMS_READ (firmware os/inc). */
++static void
++nh_event(const uint8_t *buf, int len)
++{
++	uint32_t evt;
++	if (len < 4) {
++		return;
++	}
++	evt = nh_le32(buf);
++	if (evt == NH_EVT_ALOG) {
++		char msg[120];
++		unsigned n = (unsigned)len - 4;
++		if (n >= sizeof(msg)) {
++			n = sizeof(msg) - 1;
++		}
++		memcpy(msg, buf + 4, n);
++		msg[n] = 0;
++		printf("NANOHUB: oslog: %s\n", msg);
++		return;
++	}
++	if (evt == NH_EVT_RESET_REASON) {
++		printf("NANOHUB: hub reset reason %#x; re-enabling sensors\n",
++		    len >= 8 ? nh_le32(buf + 4) : 0);
++		memset(st.enabled, 0, sizeof(st.enabled));
++		return;
++	}
++	if ((evt & 0xffffff00u) != NH_EVT_SENSOR_BASE || len < 16) {
++		if (st.dbg) {
++			printf("NANOHUB: unhandled evt %#x len %d\n", evt, len);
++		}
++		return;
++	}
++	uint8_t type = evt & 0xff;
++	const uint8_t *s = buf + 12;      /* evtType(4) + referenceTime(8) */
++	unsigned num = s[0];
++	bool triple = type == NH_SENS_ACCEL || type == NH_SENS_GYRO ||
++	    type == NH_SENS_MAG;
++	unsigned stride = triple ? 16u : 8u;
++	if (len < 12 + (int)(num * stride)) {
++		printf("NANOHUB: evt %#x claims %u samples, len %d short\n",
++		    evt, num, len);
++		return;
++	}
++	for (unsigned i = 0; i < num; i++) {
++		const uint8_t *p = s + i * stride + 4;  /* skip deltaTime/firstSample */
++		if (triple) {
++			uint32_t x = nh_le32(p), y = nh_le32(p + 4), z = nh_le32(p + 8);
++			if (type == NH_SENS_ACCEL) {
++				nh_push(SHID_ACCEL, x, y, z);
++			} else if (type == NH_SENS_GYRO) {
++				nh_push(SHID_GYRO, x, y, z);
++			} else {
++				nh_push(SHID_COMPASS, x, y, z);
++			}
++		} else {
++			uint32_t v = nh_le32(p);
++			if (type == NH_SENS_ALS) {
++				nh_push(SHID_ALS, v, 0, 0);
++			}
++			if (st.dbg && type == NH_SENS_PROX) {
++				printf("NANOHUB: prox bits %#x\n", v);
++			}
++		}
++	}
++}
++
++/* Drain the hub event queue once. Returns the number of events read. */
++static unsigned
++nh_drain(void)
++{
++	uint8_t buf[255];
++	unsigned events = 0;
++	for (unsigned i = 0; i < 32; i++) {
++		uint64_t now = mach_absolute_time();
++		int n = nh_cmd(NH_CMD_READ, (const uint8_t *)&now, sizeof(now),
++		    buf, sizeof(buf));
++		if (n <= 0) {
++			break;
++		}
++		nh_event(buf, n);
++		events++;
++	}
++	return events;
++}
++
++static void
++hub_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 10;
++	uint8_t ver[64];
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sailhubdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sailhubhz", &st.hz, sizeof(st.hz));
++	printf("NANOHUB: starting in %u s\n", delay_s);
++	hub_wait(delay_s * 1000u);
++
++	st.vote = ml_io_map(HUB_VOTE_PA, 0x1000);
++	st.cbcr = ml_io_map(HUB_CBCR & ~0xfffu, 0x1000);
++	st.rcgr = ml_io_map(HUB_RCGR & ~0xfffu, 0x1000);
++	st.qup = ml_io_map(HUB_QUP_PA, 0x1000);
++	st.gpio_clk = ml_io_map(HUB_GPIO_PA + 0x1000u * 25, 0x1000);
++	st.gpio_mosi = ml_io_map(HUB_GPIO_PA + 0x1000u * 26, 0x1000);
++	st.gpio_miso = ml_io_map(HUB_GPIO_PA + 0x1000u * 28, 0x1000);
++	st.gpio_cs = ml_io_map(HUB_GPIO_PA + 0x1000u * 27, 0x1000);
++	st.gpio_wake = ml_io_map(HUB_GPIO_PA + 0x1000u * 24, 0x1000);
++	st.gpio_reset = ml_io_map(HUB_GPIO_PA + 0x1000u * 38, 0x1000);
++	st.gpio_boot0 = ml_io_map(HUB_GPIO_PA + 0x1000u * 130, 0x1000);
++	st.gpio_irq1 = ml_io_map(HUB_GPIO_PA + 0x1000u * 123, 0x1000);
++	st.gpio_irq2 = ml_io_map(HUB_GPIO_PA + 0x1000u * 117, 0x1000);
++	if (!st.vote || !st.cbcr || !st.rcgr || !st.qup || !st.gpio_clk ||
++	    !st.gpio_mosi || !st.gpio_miso || !st.gpio_cs || !st.gpio_wake ||
++	    !st.gpio_reset || !st.gpio_boot0 || !st.gpio_irq1 || !st.gpio_irq2) {
++		printf("NANOHUB: MMIO mapping failed\n");
++		goto out;
++	}
++	/* Clocks first; pins must not toggle before the bus clock is on. */
++	if (!qup_clocks()) {
++		goto out;
++	}
++	/* Sensor hub rail (PM8994 L19, 2.85 V); always-on on Android. */
++	if (!sweet_rpm_ldoa(19, 2850000)) {
++		printf("NANOHUB: L19 vote failed; hub may be unpowered\n");
++	}
++	if (st.swap) {
++		vm_offset_t t = st.gpio_mosi;
++		st.gpio_mosi = st.gpio_miso;
++		st.gpio_miso = t;
++		printf("NANOHUB: sailhubswap=1, MOSI/MISO pins swapped\n");
++	}
++	hub_gpio_cfg(st.gpio_clk, 3, 0, false, false);   /* 25: CLK */
++	hub_gpio_cfg(st.gpio_mosi, 2, 0, false, false);  /* 26: MOSI */
++	hub_gpio_cfg(st.gpio_miso, 1, 0, false, false);  /* 28: MISO */
++	hub_gpio_cfg(st.gpio_cs, 0, 0, true, true);      /* 27: CS, idle high */
++	hub_gpio_cfg(st.gpio_wake, 0, 0, true, true);    /* 24: AP2SH */
++	hub_gpio_cfg(st.gpio_boot0, 0, 0, true, false);  /* 130: flash boot */
++	hub_gpio_cfg(st.gpio_irq1, 0, 3, false, false);  /* 123: irq1, pull-up */
++	hub_gpio_cfg(st.gpio_irq2, 0, 3, false, false);  /* 117: irq2, pull-up */
++	hub_wr(st.qup, QUP_SW_RESET, 1);
++	delay(10);
++	if (!qup_state(QUP_STATE_RESET)) {
++		printf("NANOHUB: QUP does not reach RESET (state=%#x)\n",
++		    hub_rd(st.qup, QUP_STATE));
++		goto out;
++	}
++	hub_wr(st.qup, SPI_IO_CONTROL, SPI_IOC_NO_TRI_STATE);
++	printf("NANOHUB: io=%#x hw=%#x state=%#x irq1=%u\n",
++	    hub_rd(st.qup, QUP_IO_MODE), hub_rd(st.qup, 0x30),
++	    hub_rd(st.qup, QUP_STATE), hub_rd(st.gpio_irq1, 4) & 1u);
++	/* Reset pulse: nreset low 10 ms, then high; the hub boots from flash. */
++	hub_gpio_cfg(st.gpio_reset, 0, 0, true, false);
++	hub_wait(10);
++	hub_wr(st.gpio_reset, 4, 2u);
++	hub_wait(50);
++
++	/* Probe: OS/HW version, with retries while the hub boots. */
++	int vn = -1;
++	for (unsigned i = 0; i < 100; i++) {
++		vn = nh_cmd(NH_CMD_GET_OS_HW_VERSIONS, NULL, 0, ver, sizeof(ver));
++		if (vn >= 8) {
++			break;
++		}
++		hub_wait(100);
++	}
++	if (vn < 8) {
++		printf("NANOHUB: no OS/HW version after retries; stopping\n");
++		goto out;
++	}
++	printf("NANOHUB: OS ver %#x HW ver %#x\n", nh_le32(ver), nh_le32(ver + 4));
++
++	/* Subscribe the sensors the HAL would (accel/gyro/mag/ALS). */
++	uint32_t rate = (st.hz ? st.hz : 25u) << 10;
++	static const struct {
++		uint8_t type;
++		const char *name;
++	} sensors[] = {
++		{ NH_SENS_ACCEL, "accel" },
++		{ NH_SENS_GYRO, "gyro" },
++		{ NH_SENS_MAG, "mag" },
++		{ NH_SENS_ALS, "als" },
++	};
++	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
++		int err = nh_config_sensor(sensors[i].type, true, rate);
++		printf("NANOHUB: enable %s type %u -> %s (%d)\n",
++		    sensors[i].name, sensors[i].type, err ? "failed" : "ok", err);
++	}
++
++	for (;;) {
++		bool irq = !(hub_rd(st.gpio_irq1, 4) & 1u);
++		unsigned ev = nh_drain();
++		if (ev == 0) {
++			hub_wait(irq ? 1 : 20);
++		}
++		/* Re-enable after a hub reset wiped the subscriptions. */
++		if (!st.enabled[NH_SENS_ACCEL]) {
++			for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
++				(void)nh_config_sensor(sensors[i].type, true, rate);
++			}
++		}
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sailfish_nanohub_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("sailhub", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sailhubswap", &st.swap, sizeof(st.swap));
++	(void)PE_parse_boot_argn("sailhubdbg", &st.dbg, sizeof(st.dbg));
++	if (!enabled) {
++		printf("NANOHUB: disabled (sailhub=1 to enable)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(hub_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NANOHUB: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
