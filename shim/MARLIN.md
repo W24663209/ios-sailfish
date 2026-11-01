@@ -19,8 +19,9 @@ It is not an iOS/XNU boot image yet.
 AOSP's MSM8996 HTC device tree puts both phones behind the same common board
 profile for the boot-image layout, UFS, QCA6174/CNSS PCIe, nanohub QUP6 wiring,
 and ramoops reservation. In particular, both use a 4 KiB v0 boot image with
-appended DTBs; LK tags are at `0x82600000`; and the ramoops console starts at
-`0x83540000`.
+appended DTBs. On the connected Pixel XL, LK reports its actual tags handoff at
+`0x82000000` (do not substitute Sailfish's `0x82600000` assumption); the
+ramoops console starts at `0x83540000`.
 
 ## What differs
 

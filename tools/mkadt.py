@@ -2,8 +2,10 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
---pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+address comes from the target's live FDT. Usage:
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1|--marlin]
+--pixel1: Google Pixel 1 (sailfish, MSM8996), iPhone 8 userland profile.
+--marlin: Google Pixel XL (marlin, MSM8996), headless first-boot profile.
 """
 import hashlib, os, struct, sys
 
@@ -34,18 +36,23 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-# Google Pixel 1 (sailfish, MSM8996), from its live FDT and shim probes (NOTES.md).
+# First-generation Google Pixel (sailfish / marlin, MSM8996).  Both boards
+# have the same Kryo/GIC/UFS baseline and expose an upper DDR bank above 4 GiB.
+# Values here originate in the booted DTs and shim probes.  The Marlin profile
+# intentionally starts headless: its 1440x2560 panel needs its own MDP/DSI
+# bring-up, so no Sailfish kickoff register is emitted.
 PIXEL1 = dict(
-    phys_base=0x100000000, mem_size=0x7e550000,  # upper DDR bank, no carve-outs
-    gicd=0x9bc0000, gicr=0x9c00000, gicr_stride=0x40000,  # not the usual 0x20000
-    vtimer=27,  # standard PPI numbering here (sweet: 19)
+    board='sailfish', phys_base=0x100000000, mem_size=0x7e550000,
+    gicd=0x9bc0000, gicr=0x9c00000, gicr_stride=0x40000,
+    vtimer=27,
     fb=0xc0001000, fb_size=0x31ff000, fb_w=1080, fb_h=1920, fb_bpp=24,
-    fb_kickoff=0x90201c,  # command-mode panel: MDP CTL0 START sends a frame
+    fb_kickoff=0x90201c,
     ufs=0x624000, ufs_size=0x2500,
-    # MPIDR, cluster, max clock: 2 x 1.6 GHz + 2 x 2.15 GHz Kryo
     cpus=[(0x0, 0, 1593600000), (0x1, 0, 1593600000),
           (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
 )
+MARLIN = dict(PIXEL1, board='marlin', fb_w=1440, fb_h=2560,
+              fb_kickoff=None)
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -85,13 +92,16 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, pixel1=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, pixel1=False, marlin=False):
+    """Build one board profile; qemu retains the legacy virtual-machine tree."""
+    if pixel1 and marlin:
+        raise ValueError('choose one of pixel1 or marlin')
+    msm8996 = pixel1 or marlin
+    P = MARLIN if marlin else PIXEL1
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     vtimer = QEMU_VTIMER_INTID if qemu else VTIMER_INTID
-    if pixel1:
-        P = PIXEL1
+    if msm8996:
         phys_base, mem_size, gicd, gicr, vtimer = P['phys_base'], P['mem_size'], P['gicd'], P['gicr'], P['vtimer']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -116,7 +126,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices); iPhone 8: 750x1334 @2x.
-        ('display-scale', u32(2 if pixel1 else 3)),
+        ('display-scale', u32(2 if msm8996 else 3)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -152,7 +162,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
-        if pixel1:
+        if msm8996:
             break
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
@@ -175,7 +185,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
             ('fixed-frequency', u32(timebase)),
         ]))
     # Pixel 1: 2 + 2 Kryo (same core, different clocks) as one SMP cluster too.
-    for core, (mpidr, cluster, hz) in enumerate(PIXEL1['cpus'] if pixel1 else []):
+    for core, (mpidr, cluster, hz) in enumerate(P['cpus'] if msm8996 else []):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
@@ -204,38 +214,36 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         ('interrupt-controller', b''),
         ('virtual-timer-intid', u32(vtimer)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
-    ] + ([('redistributor-stride', u32(PIXEL1['gicr_stride']))] if pixel1 else []))
+    ] + ([('redistributor-stride', u32(P['gicr_stride']))] if msm8996 else []))
+    # Reserve arm-io's handle before its child handles; this preserves the
+    # historical Sailfish ADT phandle ordering.
+    arm_io_ph = ph()
+    # The first enablement is deliberately headless: the physical XL panel has
+    # a different DSI command stream. Do not publish a Sailfish MDP kickoff
+    # register for it until that stream is brought up separately.
+    arm_children = [gic,
+        node('wdt', [ph(), ('no-pmu', u32(1))]),
+        node('disp0', [
+            ph(),
+            ('device_type', cstr('display-subsystem')),
+            ('compatible', cstr('sweet,display')),
+            ('canvas-width', u32(750 if msm8996 else 1125)),
+            ('canvas-height', u32(1334 if msm8996 else 2436)),
+        ])]
+    if pixel1:
+        arm_children.append(node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('wlan-pcie,sailfish')),
+        ]))
     arm_io = node('arm-io', [
-        ph(),
+        arm_io_ph,
         ('device_type', cstr('sweet-io')),
         ('compatible', cstr('sweet-io') + cstr('arm-io')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
-    ], [gic,
-        # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
-        # otherwise crashes trying to set the PMU boot stage (customer builds
-        # ignore the -wdt_no_pmu boot-arg).
-        node('wdt', [ph(), ('no-pmu', u32(1))]),
-        # Main display: IOMobileFramebuffer.framework counts /arm-io children
-        # with this device_type and reads the canvas size from the node
-        # (the presented iPhone X size, see SweetFramebuffer.cpp);
-        # the kernel's AppleCLCD matches the compatible string.
-        node('disp0', [
-            ph(),
-            ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(750 if pixel1 else 1125)),
-            ('canvas-height', u32(1334 if pixel1 else 2436)),
-        ])] + ([
-        # Wi-Fi (bsd/dev/sailfish_wlan.c, QCA6174 on PCIe): launchd starts
-        # wifid only if the tree has a node named wlan; SailfishWLAN (the
-        # interface's controller) matches this nub.
-        node('wlan', [
-            ph(),
-            ('device_type', cstr('wlan')),
-            ('compatible', cstr('wlan-pcie,sailfish')),
-        ])] if pixel1 else []))
+    ], arm_children)
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -244,24 +252,24 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
     ])
-    if pixel1:
-        P = PIXEL1
-        fbcon = node('sweet-fbcon', [
+    if msm8996:
+        fb_props = [
             ph(),
             ('reg', u64(P['fb'], P['fb_size'])),
             ('width', u32(P['fb_w'])),
             ('height', u32(P['fb_h'])),
             ('stride', u32(P['fb_w'] * P['fb_bpp'] // 8)),
             ('bits-per-pixel', u32(P['fb_bpp'])),
-            # write 1 here after drawing: the panel only refreshes on request
-            ('kickoff-reg', u64(P['fb_kickoff'])),
-        ])
+        ]
+        if P['fb_kickoff'] is not None:
+            fb_props.append(('kickoff-reg', u64(P['fb_kickoff'])))
+        fbcon = node('sweet-fbcon', fb_props)
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(PIXEL1['ufs'], PIXEL1['ufs_size']) if pixel1 else u64(UFS, UFS_SIZE)),
+        ('reg', u64(P['ufs'], P['ufs_size']) if msm8996 else u64(UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -275,12 +283,12 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     buttons = node('buttons', [
         ph(),
         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
-        ('home-button-type', u32(1 if pixel1 else 2)),  # iPhone 8: Home button
+        ('home-button-type', u32(1 if msm8996 else 2)),  # iPhone 8: Home button
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product(D20AP_ADT if pixel1 else D22AP_ADT)
-    if pixel1 and product_props:
+    product_props = d22ap_product(D20AP_ADT if msm8996 else D22AP_ADT)
+    if msm8996 and product_props:
         # The Pixel panel is sRGB, and with "P3" iOS picks deep-color snapshot
         # surfaces (MaterialKit b3a8, CA w30r) that CoreAnimation's CPU renderer
         # cannot draw into: the dock / App Library backgrounds stayed white.
@@ -288,14 +296,20 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
                          for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
-    # Identity of the iPhone X whose userland runs here: compatible[0] is
-    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
-    # Pixel 1 keeps 'xiaomi,sweet' for the same kernel matching (one platform expert).
-    ident = (('D20AP', 'iPhone10,1', 'D20', 'google,sailfish', 'qcom,msm8996') if pixel1 else
-             ('D22AP', 'iPhone10,3', 'D22', 'xiaomi,sweet', 'qcom,sm7150'))
-    compat = cstr(ident[0]) + cstr(ident[1]) + cstr('xiaomi,sweet')
+    # The iPhone 8 userland remains the logical product for both MSM8996 boards.
+    # Add an explicit board compatible without dropping legacy xiaomi,sweet,
+    # which keeps the existing SweetPlatformExpert bound while MARLIN support
+    # is introduced incrementally.
     if pixel1:
+        board_compat = 'google,sailfish'
+    elif marlin:
+        board_compat = 'ios-sailfish,msm8996-marlin'
+    if msm8996:
+        ident = ('D20AP', 'iPhone10,1', 'D20', board_compat, 'qcom,msm8996')
+    else:
+        ident = ('D22AP', 'iPhone10,3', 'D22', 'xiaomi,sweet', 'qcom,sm7150')
+    compat = cstr(ident[0]) + cstr(ident[1]) + cstr('xiaomi,sweet')
+    if msm8996:
         compat += cstr(ident[3])
     return node('device-tree', [
         ph(),
@@ -310,7 +324,9 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv)
+    marlin = '--marlin' in sys.argv
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 pixel1='--pixel1' in sys.argv, marlin=marlin)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

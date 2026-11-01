@@ -23,7 +23,8 @@
 #define FB_CAN_KICK             1
 #elif defined(MARLIN)
 #define BOARD_NAME              "pixel xl (marlin)"
-#define TAGS_ADDR               0x82600000UL
+/* Observed in this device's LK log: tags/device tree @ 0x82000000. */
+#define TAGS_ADDR               0x82000000UL
 #define PSTORE_CONSOLE_BASE     0x83540000UL
 /*
  * The XL shares the 0xc0001000 continuous-splash reservation with sailfish,
