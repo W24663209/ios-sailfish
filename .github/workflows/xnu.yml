@@ -72,7 +72,16 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::group::build errors (clang/gcc)"
+            grep -n -A8 -m 40 -E 'error:|Error ' build.log || tail -200 build.log
+            echo "::endgroup::"
+          fi
+          exit "$status"
 
       - name: Package build tree for local compiles
         if: always()
@@ -85,7 +94,7 @@ jobs:
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C dxb build/xnu.obj build.log fakeroot/usr/local/include xnu \
             -C .. sdk-kernel-platform
           ls -la buildtree.tgz
 
