@@ -33,7 +33,7 @@
      "   {"
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -1894,7 +1894,162 @@
+@@ -1894,7 +1894,163 @@
  extern "C" void
  sweet_hid_touch(int finger, int down, int x, int y)
  {
@@ -41,6 +41,7 @@
  		gSweetTouch->touch(finger, down != 0, x, y);
  	}
  }
++class SweetHIDSensor;
 +/*
 + * Sensor event services fed by the nanohub driver (bsd/dev/sailfish_nanohub.c
 + * -> sweet_hid_sensor()). One service per physical sensor; which one a
