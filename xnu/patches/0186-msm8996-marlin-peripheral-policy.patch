@@ -1,0 +1,96 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sailfish_wlan.c			standard
+ bsd/dev/sailfish_nanohub.c		standard
++bsd/dev/msm8996_board.c		standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@
+ extern void sailfish_wlan_init(void);
+ extern void sailfish_nanohub_init(void);
+ extern void sweet_usb_probe(void);
++extern bool msm8996_board_is_marlin(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,16 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	/*
++	 * Marlin shares the MSM8996 UFS/GIC platform, but its panel, input,
++	 * power and peripheral sequencing is deliberately deferred. Do not let
++	 * a shared machine config touch Sailfish-only MMIO before those profiles
++	 * exist. The UFS root stays read-only unless ufsrw=1 was explicitly set.
++	 */
++	if (msm8996_board_is_marlin()) {
++		printf("MSM8996 BOARD: Marlin UFS/log only; Sailfish peripherals disabled\n");
++		return 0;
++	}
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+--- /dev/null
++++ b/bsd/dev/msm8996_board.c
+@@ -0,0 +1,56 @@
++/*
++ * Runtime board identity for the MSM8996 XNU port.
++ *
++ * The kernel still builds as MACHINE_CONFIG=SWEET because that controls the
++ * shared Kryo/GIC/UFS platform implementation.  Board peripherals must not
++ * inherit Sailfish register sequences merely because the SoC is shared.  The
++ * generated Marlin ADT adds ios-sailfish,msm8996-marlin to root compatible.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/device_tree.h>
++
++static bool
++msm8996_compatible_has(const char *property, unsigned size, const char *want)
++{
++	unsigned at = 0;
++	while (at < size) {
++		unsigned n = 0;
++		while (at + n < size && property[at + n] != '\0') {
++			n++;
++		}
++		unsigned i = 0;
++		while (i < n && want[i] != '\0' && property[at + i] == want[i]) {
++			i++;
++		}
++		if (i == n && want[i] == '\0') {
++			return true;
++		}
++		at += n + 1;
++	}
++	return false;
++}
++
++bool
++msm8996_board_is_marlin(void)
++{
++	static int cached = -1;
++	DTEntry root;
++	void const *value = NULL;
++	unsigned size = 0;
++
++	if (cached >= 0) {
++		return cached != 0;
++	}
++	cached = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess &&
++	    SecureDTGetProperty(root, "compatible", &value, &size) == kSuccess &&
++	    value != NULL) {
++		cached = msm8996_compatible_has((const char *)value, size,
++		    "ios-sailfish,msm8996-marlin") ? 1 : 0;
++	}
++	printf("MSM8996 BOARD: %s\n", cached ? "marlin (peripherals deferred)" : "sailfish");
++	return cached != 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
