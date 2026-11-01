@@ -8,6 +8,7 @@
 #include "console.h"
 #include "loader.h"
 #include "pstore.h"
+#include "board.h"
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define APSS_WDT		0x9830000UL	/* qcom,wdt@9830000, 32768 Hz ticks */
@@ -37,12 +38,11 @@ static void delay_ms(unsigned ms)
 }
 
 /*
- * The payload (tools/mkpayload.py) is appended to this Image at _end by
- * build-pixel.sh: LK decompresses the kernel to 0x80080000 and the room up to
- * the DTB at 0x82600000 is ~37 MB. (The ramdisk slot is no good: LK forces it
- * to 0x82800000, refused a 24 MiB one, and it runs into ramoops at 13 MiB.)
+ * The payload is appended to this Image at _end.  The first-generation Pixel
+ * pair has the same Android boot-image base/tags layout; its bootloader places
+ * the DTB at TAGS_ADDR.  The board profile owns that address rather than this
+ * loader assuming sailfish implicitly.
  */
-#define TAGS_ADDR	0x82600000UL	/* where LK puts the DTB */
 
 extern char _end[];
 
@@ -54,14 +54,14 @@ void shim_main(uint64_t dtb)
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	plog_init();
-	plog_str("PIXEL1 SHIM: loader\n");
+	plog_str("PIXEL SHIM: loader\n");
 	plog_hex("WDT_EN was", wdt_en);
 	plog_hex("WDT_BITE", wdt_bite);
 	plog_hex("DTB", dtb);
 	plog_hex("PAYLOAD", (uintptr_t)_end);
 
 	con_clear(0);
-	con_str("SHIM", "pixel1 (sailfish) loader");
+	con_str("SHIM", BOARD_NAME);
 	con_skip();
 	/*
 	 * Re-arm the watchdog for the kernel (bite WDT_SECS after this): a hang

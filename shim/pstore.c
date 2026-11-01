@@ -6,8 +6,9 @@
  * MMU off: plain device accesses straight to DRAM, byte stores only.
  */
 #include "pstore.h"
+#include "board.h"
 
-#define PRZ_BASE	0x83540000UL
+#define PRZ_BASE	PSTORE_CONSOLE_BASE
 #define PRZ_DATA_MAX	(0x80000UL - 12)
 #define PRZ_SIG		0x43474244U	/* "DBGC" */
 
