@@ -73,19 +73,26 @@ jobs:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
-          set -o pipefail
+          # the runner shell defaults to bash -e: don't let the failing pipeline
+          # kill this script before the error-reporting block below can run
+          set +e
           bash build.sh 2>&1 | tee build.log
           status=${PIPESTATUS[0]}
+          set -e
           if [ "$status" -ne 0 ]; then
-            echo "::group::build errors (clang/gcc)"
-            grep -n -A8 -m 40 -E 'error:|Error ' build.log | head -320 > errors.txt
-            cat errors.txt
+            echo "::group::build errors (grep)"
+            grep -n -A8 -m 40 -E 'error:|Error ' build.log | head -320
             echo "::endgroup::"
-            # also as annotations: the check-run annotations API is readable
-            # without a token, so iteratees can be fetched programmatically
-            grep -n -A6 -m 24 -E 'error:' build.log | head -140 | while IFS= read -r line; do
-              printf '::error::%.4000s\n' "$line"
+            # mirror the log tail as annotations: the check-run annotations
+            # API is readable without a token, so iteratees can be fetched
+            # programmatically
+            { grep -n -m 12 -E 'error:|FAILED|fatal:' build.log
+              echo '===== build.log tail ====='
+              tail -14 build.log
+            } | while IFS= read -r line; do
+              printf '::error::%.3000s\n' "$line"
             done || true
+            printf '::notice::build.log: %s lines\n' "$(wc -l < build.log | tr -d ' ')"
           fi
           exit "$status"
 

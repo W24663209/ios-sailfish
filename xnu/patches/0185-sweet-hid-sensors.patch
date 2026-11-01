@@ -1,35 +1,36 @@
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -75,5 +75,29 @@
-     "   {",
+@@ -75,6 +75,30 @@
+     "   {"
      "     'IOClass'         = SweetHIDTouch;"
      "     'IOProviderClass' = IOResources;"
      "     'IOMatchCategory' = SweetHIDTouch;"
      "   },"
-+    "   {",
++    "   {"
 +    "     'IOClass'         = SweetHIDSensor;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = SweetHIDSensorAccel;"
 +    "     'SensorKind'      = 0;"
 +    "   },"
-+    "   {",
++    "   {"
 +    "     'IOClass'         = SweetHIDSensor;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = SweetHIDSensorGyro;"
 +    "     'SensorKind'      = 1;"
 +    "   },"
-+    "   {",
++    "   {"
 +    "     'IOClass'         = SweetHIDSensor;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = SweetHIDSensorCompass;"
 +    "     'SensorKind'      = 2;"
 +    "   },"
-+    "   {",
++    "   {"
 +    "     'IOClass'         = SweetHIDSensor;"
 +    "     'IOProviderClass' = IOResources;"
 +    "     'IOMatchCategory' = SweetHIDSensorAls;"
 +    "     'SensorKind'      = 3;"
 +    "   },"
+     "   {"
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
 @@ -1894,7 +1894,162 @@
