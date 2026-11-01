@@ -32,6 +32,25 @@ GCC 4.9 cross compilers. The old Linux 3.18 host DTC requires `-fcommon` with
 modern host GCC. The resulting module's SHA-256 and vermagic must be checked
 before a temporary TWRP load test.
 
+## Phase 1 result
+
+Phase 1 loaded and unloaded successfully in temporary TWRP. It performed only
+read-only scheduler/resource inspection and measured:
+
+```text
+online CPUs: 0, 1, 2, 3
+boot CPU MPIDR: 0x80000000
+total pages: 964002
+recovery kernel code: 0x80080000–0x8174dfff
+recovery kernel data: 0x817ee000–0x81cc1fff
+upper available RAM: 0x91700000–0x17e54ffff
+APSS watchdog: 0x09830000–0x09830fff
+```
+
+The module initially attempted to use `__cpu_logical_map`; `MODPOST` reported
+that it is not exported, so that build was not loaded. The committed Phase 1
+module uses exported symbols only.
+
 ## Load-test boundary
 
 A test still requires explicit confirmation because `insmod` executes code in

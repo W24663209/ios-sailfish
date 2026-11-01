@@ -20,7 +20,8 @@ from a fresh stock DTB if the device firmware changes.
 | --- | --- | --- |
 | GIC distributor | `0x09bc0000`, 64 KiB | active DTB `interrupt-controller@09bc0000` |
 | GIC redistributor | `0x09c00000`, 1 MiB, stride `0x40000` | same DT node |
-| UFS host | `0x00624000`, 0x2500 bytes | active DTB `ufshc@624000`, `/proc/iomem` |
+| UFS host | `0x00624000`, 0x2500 bytes | active DTB, Android `/proc/iomem`, TWRP Phase 1 module |
+| APSS watchdog | `0x09830000`, 4 KiB | TWRP Phase 1 module |
 | Nanohub QUP6 SPI | `0x0757a000` | active DTB `spi@757a000` |
 | Nanohub control | reset 38, boot0 130, wake 24, IRQ1 123, IRQ2 117, CS 27 | active `sensorhub@0` |
 | Touch QUP3 I2C | `0x07577000`, Synaptics DSX addr `0x20` | active DTB |
@@ -28,6 +29,9 @@ from a fresh stock DTB if the device firmware changes.
 | Ramoops | `0x83500000`, 1 MiB; console `0x83540000`, 512 KiB | active DTB + `/proc/iomem` |
 | Continuous splash | `0xc0001000`, `0x31ff000` bytes | active DTB |
 | LK DTB handoff | `0x82000000` | ABL persistent log |
+| Recovery kernel | code `0x80080000–0x8174dfff`; data `0x817ee000–0x81cc1fff` | TWRP Phase 1 module |
+| Recovery available RAM | `0x80000000–0x834fffff`, `0x84000000–0x857fffff`, `0x91700000–0x17e54ffff` | TWRP Phase 1 module |
+| Recovery CPU state | 4 online CPUs; boot CPU MPIDR `0x80000000`; 964002 total pages | TWRP Phase 1 module |
 
 ## Board-specific items deliberately disabled
 
