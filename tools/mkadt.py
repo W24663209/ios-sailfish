@@ -222,14 +222,18 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, marlin=False):
     # a different DSI command stream. Do not publish a Sailfish MDP kickoff
     # register for it until that stream is brought up separately.
     arm_children = [gic,
-        node('wdt', [ph(), ('no-pmu', u32(1))]),
-        node('disp0', [
+        node('wdt', [ph(), ('no-pmu', u32(1))])]
+    # Marlin first boot is deliberately display-headless. The XL panel has a
+    # different command stream and no safe present backend yet, so publishing
+    # sweet,display could bind AppleCLCD and touch MDP/DSI registers.
+    if not marlin:
+        arm_children.append(node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(750 if msm8996 else 1125)),
             ('canvas-height', u32(1334 if msm8996 else 2436)),
-        ])]
+        ]))
     if pixel1:
         arm_children.append(node('wlan', [
             ph(),
