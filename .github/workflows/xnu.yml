@@ -78,8 +78,14 @@ jobs:
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             echo "::group::build errors (clang/gcc)"
-            grep -n -A8 -m 40 -E 'error:|Error ' build.log || tail -200 build.log
+            grep -n -A8 -m 40 -E 'error:|Error ' build.log | head -320 > errors.txt
+            cat errors.txt
             echo "::endgroup::"
+            # also as annotations: the check-run annotations API is readable
+            # without a token, so iteratees can be fetched programmatically
+            grep -n -A6 -m 24 -E 'error:' build.log | head -140 | while IFS= read -r line; do
+              printf '::error::%.4000s\n' "$line"
+            done || true
           fi
           exit "$status"
 
