@@ -80,19 +80,21 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::group::build errors (grep)"
-            grep -n -A8 -m 40 -E 'error:|Error ' build.log | head -320
-            echo "::endgroup::"
-            # mirror the log tail as annotations: the check-run annotations
-            # API is readable without a token, so iteratees can be fetched
-            # programmatically
-            { grep -n -m 12 -E 'error:|FAILED|fatal:' build.log
-              echo '===== build.log tail ====='
-              tail -14 build.log
-            } | while IFS= read -r line; do
+            # <=10 error annotations survive per step, so curate: real clang
+            # errors first (patch-skip warnings also contain "error:" but
+            # never match :N:N:), then the raw log tail for make/link errors
+            report=$(mktemp)
+            grep -n -E ':[0-9]+:[0-9]+: (fatal )?error:' build.log | head -5 > "$report"
+            tail -3 build.log >> "$report"
+            while IFS= read -r line; do
               printf '::error::%.3000s\n' "$line"
-            done || true
-            printf '::notice::build.log: %s lines\n' "$(wc -l < build.log | tr -d ' ')"
+            done < "$report" || true
+            echo "::group::curated error report"
+            cat "$report"
+            echo "::endgroup::"
+            printf '::notice::build.log: %s lines, clang errors: %s\n' \
+              "$(wc -l < build.log | tr -d ' ')" \
+              "$(grep -c -E ':[0-9]+:[0-9]+: (fatal )?error:' build.log)"
           fi
           exit "$status"
 

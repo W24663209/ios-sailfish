@@ -391,20 +391,20 @@
 +nh_scan(const uint8_t *buf, unsigned len, unsigned *out_off)
 +{
 +	for (unsigned i = 0; i + 11u <= len; i++) {
-+		unsigned plen, total;
++		unsigned plen, psize;
 +		uint32_t crc;
 +		if (buf[i] != NH_SYNC) {
 +			continue;
 +		}
 +		plen = buf[i + 9];
-+		total = 10u + plen + 4u;
-+		if (i + total > len) {
++		psize = 10u + plen + 4u;
++		if (i + psize > len) {
 +			continue;
 +		}
 +		crc = nh_crc32(buf + i, 10u + plen, ~0u);
 +		if (crc == nh_le32(buf + i + 10u + plen)) {
 +			*out_off = i;
-+			return total;
++			return psize;
 +		}
 +	}
 +	return 0;
